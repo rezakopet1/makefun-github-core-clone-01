@@ -143,6 +143,14 @@ export interface Repo {
   nextComment: number;
   version: number;
   fetchCache: Map<string, Buffer>;
+  // Deterministic-response caches, all dropped by touchRepo on any git mutation.
+  v0UpCache: Buffer | null;
+  v0RecvCache: Buffer | null;
+  lsRefsCache: Map<string, Buffer>;
+  sortedRefsCache: Array<{ name: string; oid: string }> | null;
+  // Serialized single-issue GET bodies (with trailing newline), dropped on
+  // any issue/label mutation via invalidateIssueJson / invalidateAllIssueJson.
+  issueJsonCache: Map<number, string>;
 }
 
 function b64urlEncode(text: string): string {
@@ -215,6 +223,11 @@ export class Store {
       nextComment: 1,
       version: 0,
       fetchCache: new Map(),
+      v0UpCache: null,
+      v0RecvCache: null,
+      lsRefsCache: new Map(),
+      sortedRefsCache: null,
+      issueJsonCache: new Map(),
     };
     this.repos.set(k, repo);
     this.repoOrder.push(repo);
@@ -626,10 +639,24 @@ function inflateEntry(buf: Buffer, start: number, end: number): { data: Buffer; 
   return { data, consumed: zlibConsumed(buf, start, end) };
 }
 
-/** Bump a repo's mutation version and drop its cached fetch responses. */
+/** Bump a repo's mutation version and drop its cached git responses. */
 export function touchRepo(repo: Repo): void {
   repo.version += 1;
   repo.fetchCache.clear();
+  repo.v0UpCache = null;
+  repo.v0RecvCache = null;
+  repo.lsRefsCache.clear();
+  repo.sortedRefsCache = null;
+}
+
+/** Drop the cached serialized GET body for one issue (after a patch/comment). */
+export function invalidateIssueJson(repo: Repo, number: number): void {
+  repo.issueJsonCache.delete(number);
+}
+
+/** Drop all cached serialized issue GET bodies (after a label change). */
+export function invalidateAllIssueJson(repo: Repo): void {
+  repo.issueJsonCache.clear();
 }
 
 // Packfile helpers (plain objects only, no deltas) ---------------------------

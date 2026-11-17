@@ -14,11 +14,52 @@ import {
   type Store,
 } from './store.ts';
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** 4-char lowercase hex of a pkt-line length (0..65520), as a string. */
+function hex4(n: number): string {
+  return (
+    HEX_DIGITS[(n >> 12) & 0xf] + HEX_DIGITS[(n >> 8) & 0xf] + HEX_DIGITS[(n >> 4) & 0xf] + HEX_DIGITS[n & 0xf]
+  );
+}
+
+/** Numeric value of one ASCII hex digit, or -1. */
+function hexVal(c: number): number {
+  if (c >= 48 && c <= 57) return c - 48;
+  if (c >= 97 && c <= 102) return c - 87;
+  if (c >= 65 && c <= 70) return c - 55;
+  return -1;
+}
+
+/** One pkt-line frame for a string payload: a single allocation, no concat. */
 export function pktLine(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const head = Buffer.alloc(4);
-  head.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([head, data]);
+  const out = Buffer.allocUnsafe(4 + data.length);
+  const len = data.length + 4;
+  out[0] = HEX_DIGITS.charCodeAt((len >> 12) & 0xf);
+  out[1] = HEX_DIGITS.charCodeAt((len >> 8) & 0xf);
+  out[2] = HEX_DIGITS.charCodeAt((len >> 4) & 0xf);
+  out[3] = HEX_DIGITS.charCodeAt(len & 0xf);
+  data.copy(out, 4);
+  return out;
+}
+
+/**
+ * Frame several ASCII lines as pkt-lines into ONE string, then one Buffer.
+ * Byte length (not string length) prefixes each line, so non-ASCII ref names
+ * stay correct; the single Buffer.from at the end is the only allocation.
+ */
+function frameLines(lines: string[]): Buffer {
+  let s = '';
+  for (const line of lines) s += hex4(Buffer.byteLength(line) + 4) + line;
+  return Buffer.from(s, 'utf8');
+}
+
+/** Frame lines plus a trailing flush (0000) as one buffer. */
+function frameLinesFlush(lines: string[]): Buffer {
+  let s = '';
+  for (const line of lines) s += hex4(Buffer.byteLength(line) + 4) + line;
+  return Buffer.from(`${s}0000`, 'utf8');
 }
 
 export const pktFlush = (): Buffer => Buffer.from('0000', 'ascii');
@@ -33,9 +74,12 @@ export function decodePktLines(buf: Buffer): Pkt[] {
   const out: Pkt[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const lenText = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenText)) break;
-    const len = parseInt(lenText, 16);
+    const h0 = hexVal(buf[off] as number);
+    const h1 = hexVal(buf[off + 1] as number);
+    const h2 = hexVal(buf[off + 2] as number);
+    const h3 = hexVal(buf[off + 3] as number);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
+    const len = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
     if (len === 0) {
       out.push({ kind: 'flush', payload: Buffer.alloc(0) });
       off += 4;
@@ -59,17 +103,21 @@ export function decodePktLines(buf: Buffer): Pkt[] {
 }
 
 export function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
-  return [...repo.refs.entries()]
+  const cached = repo.sortedRefsCache;
+  if (cached !== null) return cached;
+  const refs = [...repo.refs.entries()]
     .map(([name, oid]) => ({ name, oid }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  repo.sortedRefsCache = refs;
+  return refs;
 }
 
 export function headTarget(repo: Repo): string {
   return `refs/heads/${repo.defaultBranch}`;
 }
 
-/** v2 capability advertisement body for git-upload-pack. */
-export function v2Advertisement(): Buffer {
+/** v2 capability advertisement body for git-upload-pack: a constant, built once. */
+const V2_ADVERTISEMENT: Buffer = (() => {
   const lines = [
     'version 2\n',
     'agent=github-core-clone/1.0\n',
@@ -78,37 +126,46 @@ export function v2Advertisement(): Buffer {
     'server-option\n',
     'object-format=sha1\n',
   ];
-  return Buffer.concat([pktLine('# service=git-upload-pack\n'), pktFlush(), ...lines.map((l) => pktLine(l)), pktFlush()]);
+  return Buffer.concat([pktLine('# service=git-upload-pack\n'), pktFlush(), frameLinesFlush(lines)]);
+})();
+
+export function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
-/** v0 ref advertisement body for a service. */
+/** v0 ref advertisement body for a service; cached per repo version. */
 export function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
-  const preamble = pktLine(`# service=${service}\n`);
+  const cached = service === 'git-upload-pack' ? repo.v0UpCache : repo.v0RecvCache;
+  if (cached !== null) return cached;
   const refs = sortedRefs(repo);
   const caps =
     service === 'git-receive-pack'
       ? 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=github-core-clone/1.0'
       : 'side-band-64k multi_ack_detailed thin-pack ofs-delta shallow agent=github-core-clone/1.0';
-  const parts: Buffer[] = [preamble, pktFlush()];
   const head = headTarget(repo);
   const headOid = repo.refs.get(head);
+  const lines: string[] = [];
   if (refs.length === 0) {
-    const line = `${ZERO_OID} capabilities^{}\0${caps}\n`;
-    parts.push(pktLine(line));
+    lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
     // HEAD first, with symref capability, then refs in sorted order.
-    const headLine = `${headOid ?? ZERO_OID} HEAD\0${caps} symref=HEAD:${head}\n`;
-    parts.push(pktLine(headLine));
+    lines.push(`${headOid ?? ZERO_OID} HEAD\0${caps} symref=HEAD:${head}\n`);
     for (const ref of refs) {
-      parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
+      lines.push(`${ref.oid} ${ref.name}\n`);
       const obj = repo.objects.get(ref.oid);
       if (obj && obj.type === 'tag') {
-        parts.push(pktLine(`${repoPeel(repo, ref.oid)} ${ref.name}^{}\n`));
+        lines.push(`${repoPeel(repo, ref.oid)} ${ref.name}^{}\n`);
       }
     }
   }
-  parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat([
+    pktLine(`# service=${service}\n`),
+    pktFlush(),
+    frameLinesFlush(lines),
+  ]);
+  if (service === 'git-upload-pack') repo.v0UpCache = out;
+  else repo.v0RecvCache = out;
+  return out;
 }
 
 function repoPeel(repo: Repo, oid: string): string {
@@ -223,21 +280,31 @@ export function fetchObjects(
 }
 
 export function sidebandPack(pack: Buffer): Buffer {
-  const parts: Buffer[] = [];
   // Max pkt-line is 65520 bytes total (4 header + payload); the band byte
-  // leaves 65515 bytes of pack data per frame.
+  // leaves 65515 bytes of pack data per frame. One allocation per frame.
   const CHUNK = 65515;
-  for (let off = 0; off < pack.length; off += CHUNK) {
-    const slice = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    const framed = Buffer.concat([Buffer.from([1]), slice]);
-    parts.push(pktLine(framed));
-  }
-  if (pack.length === 0) {
-    // An empty pack still needs a sideband frame carrying the pack bytes.
-    const empty = writePack([]);
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), empty])));
+  const data = pack.length === 0 ? writePack([]) : pack;
+  const frames = Math.max(1, Math.ceil(data.length / CHUNK));
+  const parts: Buffer[] = new Array(frames);
+  for (let i = 0; i < frames; i++) {
+    const off = i * CHUNK;
+    const len = Math.min(CHUNK, data.length - off);
+    const frame = Buffer.allocUnsafe(4 + 1 + len);
+    const total = 5 + len;
+    frame[0] = HEX_DIGITS.charCodeAt((total >> 12) & 0xf);
+    frame[1] = HEX_DIGITS.charCodeAt((total >> 8) & 0xf);
+    frame[2] = HEX_DIGITS.charCodeAt((total >> 4) & 0xf);
+    frame[3] = HEX_DIGITS.charCodeAt(total & 0xf);
+    frame[4] = 1;
+    data.copy(frame, 5, off, off + len);
+    parts[i] = frame;
   }
   return Buffer.concat(parts);
+}
+
+/** Strip one trailing '\n' without a regex. */
+function stripNl(line: string): string {
+  return line.endsWith('\n') ? line.slice(0, -1) : line;
 }
 
 /** Parse a v2 upload-pack request body into ls-refs / fetch arguments. */
@@ -270,7 +337,7 @@ export function parseV2Request(body: Buffer): V2Request | null {
   };
   for (const p of packets) {
     if (p.kind !== 'data') continue;
-    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    const line = stripNl(p.payload.toString('utf8'));
     if (line.startsWith('command=')) {
       req.command = line.slice('command='.length);
       continue;
@@ -309,7 +376,9 @@ export function parseV2Request(body: Buffer): V2Request | null {
 // ---- upload-pack responses + receive-pack (appended second pass) -----------
 
 export function lsRefsResponse(repo: Repo, req: V2Request): Buffer {
-  const parts: Buffer[] = [];
+  const cacheKey = `${req.prefixes.join('\0')}|${req.peel ? 1 : 0}${req.symrefs ? 1 : 0}${req.unborn ? 1 : 0}`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const head = headTarget(repo);
   const headOid = repo.refs.get(head);
   const refs = sortedRefs(repo);
@@ -317,10 +386,10 @@ export function lsRefsResponse(repo: Repo, req: V2Request): Buffer {
     req.prefixes.length === 0 || req.prefixes.some((p) => name.startsWith(p));
   const keepHead =
     req.prefixes.length === 0 || req.prefixes.some((p) => 'HEAD'.startsWith(p) || p.startsWith('HEAD'));
+  const lines: string[] = [];
   if (req.symrefs && keepHead) {
-    const target = headOid === undefined ? head : head;
-    const line = headOid === undefined ? `unborn HEAD symref-target:${target}\n` : `${headOid} HEAD symref-target:${target}\n`;
-    parts.push(pktLine(line));
+    const target = head;
+    lines.push(headOid === undefined ? `unborn HEAD symref-target:${target}\n` : `${headOid} HEAD symref-target:${target}\n`);
   }
   for (const ref of refs) {
     if (!keep(ref.name)) continue;
@@ -329,13 +398,34 @@ export function lsRefsResponse(repo: Repo, req: V2Request): Buffer {
       const obj = repo.objects.get(ref.oid);
       if (obj && obj.type === 'tag') line += ` peeled:${repoPeel(repo, ref.oid)}`;
     }
-    parts.push(pktLine(`${line}\n`));
+    lines.push(`${line}\n`);
   }
   if (refs.length === 0 && req.unborn && !req.symrefs) {
-    parts.push(pktLine(`unborn HEAD symref-target:${head}\n`));
+    lines.push(`unborn HEAD symref-target:${head}\n`);
   }
-  parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = frameLinesFlush(lines);
+  repo.lsRefsCache.set(cacheKey, out);
+  return out;
+}
+
+/**
+ * Fetch cache key. Fast path for the common single-want, no-haves case
+ * (every clone/fetch in the suite): no spread, no sort, no join.
+ */
+function fetchCacheKey(
+  prefix: string,
+  wants: string[],
+  haves: string[],
+  depth: number | null,
+  shallow: string[],
+): string {
+  if (wants.length === 1 && haves.length === 0 && shallow.length === 0) {
+    return `${prefix}|${wants[0]}|${depth ?? ''}`;
+  }
+  const w = wants.length <= 1 ? wants.join(',') : [...wants].sort().join(',');
+  const h = haves.length <= 1 ? haves.join(',') : [...haves].sort().join(',');
+  const s = shallow.length <= 1 ? shallow.join(',') : [...shallow].sort().join(',');
+  return `${prefix}|${w}|${h}|${depth ?? ''}|${s}`;
 }
 
 export function v2FetchResponse(
@@ -343,7 +433,7 @@ export function v2FetchResponse(
   repo: Repo,
   req: V2Request,
 ): Buffer {
-  const cacheKey = `v2|${[...req.wants].sort().join(',')}|${[...req.haves].sort().join(',')}|${req.depth ?? ''}|${[...req.shallow].sort().join(',')}`;
+  const cacheKey = fetchCacheKey('v2', req.wants, req.haves, req.depth, req.shallow);
   const cached = repo.fetchCache.get(cacheKey);
   if (cached !== undefined) return cached;
   const { objects, shallow, unshallow } = fetchObjects(store, repo, req.wants, req.haves, req.depth, req.shallow);
@@ -374,7 +464,7 @@ export function v0FetchResponse(
   depth: number | null,
   shallowBoundaries: string[],
 ): Buffer {
-  const cacheKey = `v0|${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${depth ?? ''}|${[...shallowBoundaries].sort().join(',')}`;
+  const cacheKey = fetchCacheKey('v0', wants, haves, depth, shallowBoundaries);
   const cached = repo.fetchCache.get(cacheKey);
   if (cached !== undefined) return cached;
   const { objects, shallow, unshallow } = fetchObjects(store, repo, wants, haves, depth, shallowBoundaries);
@@ -407,16 +497,19 @@ export function parseReceivePack(body: Buffer): { commands: PushCommand[]; pack:
   let off = 0;
   let packStart = -1;
   while (off + 4 <= body.length) {
-    const lenText = body.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenText)) break;
-    const len = parseInt(lenText, 16);
+    const h0 = hexVal(body[off] as number);
+    const h1 = hexVal(body[off + 1] as number);
+    const h2 = hexVal(body[off + 2] as number);
+    const h3 = hexVal(body[off + 3] as number);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
+    const len = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
     if (len === 0) {
       packStart = off + 4;
       break;
     }
     if (len < 4 || off + len > body.length) break;
     const payload = body.subarray(off + 4, off + len);
-    const line = payload.toString('utf8').replace(/\n$/, '');
+    const line = stripNl(payload.toString('utf8'));
     const nul = line.indexOf('\0');
     const head = nul < 0 ? line : line.slice(0, nul);
     const bits = head.split(' ');
@@ -437,6 +530,7 @@ export function applyPush(
   pack: Buffer | null,
 ): PushReport {
   const report: PushReport = { unpackOk: true, refs: [] };
+  let refChanged = false;
   if (pack !== null && pack.length > 0) {
     try {
       const objects = readPack(pack);
@@ -461,6 +555,7 @@ export function applyPush(
         report.refs.push({ ref: cmd.ref, ok: false, reason: 'old value does not match' });
       } else {
         repo.refs.delete(cmd.ref);
+        refChanged = true;
         report.refs.push({ ref: cmd.ref, ok: true, reason: '' });
       }
       continue;
@@ -475,6 +570,7 @@ export function applyPush(
         continue;
       }
       repo.refs.set(cmd.ref, cmd.newOid);
+      refChanged = true;
       report.refs.push({ ref: cmd.ref, ok: true, reason: '' });
       continue;
     }
@@ -487,8 +583,10 @@ export function applyPush(
       continue;
     }
     repo.refs.set(cmd.ref, cmd.newOid);
+    refChanged = true;
     report.refs.push({ ref: cmd.ref, ok: true, reason: '' });
   }
+  if (refChanged) touchRepo(repo);
   return report;
 }
 
@@ -497,8 +595,15 @@ export function pushReportResponse(report: PushReport): Buffer {
   for (const r of report.refs) {
     lines.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`);
   }
-  const inner = Buffer.concat(lines.map((l) => pktLine(l)));
-  const framed = pktLine(Buffer.concat([Buffer.from([1]), inner]));
+  const inner = frameLines(lines);
+  const framed = Buffer.allocUnsafe(4 + 1 + inner.length);
+  const total = 5 + inner.length;
+  framed[0] = HEX_DIGITS.charCodeAt((total >> 12) & 0xf);
+  framed[1] = HEX_DIGITS.charCodeAt((total >> 8) & 0xf);
+  framed[2] = HEX_DIGITS.charCodeAt((total >> 4) & 0xf);
+  framed[3] = HEX_DIGITS.charCodeAt(total & 0xf);
+  framed[4] = 1;
+  inner.copy(framed, 5);
   return Buffer.concat([framed, pktFlush()]);
 }
 
@@ -508,7 +613,7 @@ export function parseV0Fetch(body: Buffer): { wants: string[]; haves: string[]; 
   const out = { wants: [] as string[], haves: [] as string[], depth: null as number | null, shallow: [] as string[] };
   for (const p of packets) {
     if (p.kind !== 'data') continue;
-    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    const line = stripNl(p.payload.toString('utf8'));
     const firstSpace = line.indexOf(' ');
     const key = firstSpace < 0 ? line : line.slice(0, firstSpace);
     const rest = firstSpace < 0 ? '' : line.slice(firstSpace + 1);

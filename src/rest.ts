@@ -8,12 +8,15 @@ import {
   VIEWER_LOGIN,
   VIEWER_NAME,
   diffFiles,
+  invalidateAllIssueJson,
+  invalidateIssueJson,
   parseCommit,
   storeCommitFile,
   storeCreateIssue,
   storeCreatePull,
   storeMergePull,
   pullMergeable,
+  touchRepo,
   type Issue,
   type Pull,
   type Repo,
@@ -24,6 +27,11 @@ export interface RestResult {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /**
+   * Pre-serialized JSON body (including the trailing newline sendJson adds).
+   * When present, app.ts sends it as-is instead of stringifying `body`.
+   */
+  bodyText?: string;
 }
 
 const notFound = (message = 'Not Found'): RestResult => ({ status: 404, body: { message } });
@@ -302,6 +310,7 @@ export function handleRest(
       if (labelName === '') return badRequest('name is required');
       const color = typeof body?.color === 'string' ? (body.color as string) : 'ededed';
       repo.labels.set(labelName, { name: labelName, color });
+      invalidateAllIssueJson(repo);
       return { status: 201, body: { name: labelName, color, description: '' } };
     }
     if (method === 'GET') {
@@ -327,6 +336,7 @@ function handleGitData(store: Store, repo: Repo, method: string, rest: string[],
       if (repo.refs.has(ref)) return { status: 422, body: { message: 'Reference already exists' } };
       if (!repo.objects.has(sha)) return { status: 422, body: { message: 'object does not exist' } };
       repo.refs.set(ref, sha);
+      touchRepo(repo);
       const type = repo.objects.get(sha)?.type ?? 'commit';
       return { status: 201, body: { ref, object: { sha, type }, node_id: `R_${sha}` } };
     }
@@ -489,8 +499,15 @@ function handleIssues(store: Store, repo: Repo, method: string, rest: string[], 
   const issue = repo.issues.find((i) => i.number === num);
   if (issue === undefined) return notFound();
   if (rest.length === 1) {
-    if (method === 'GET') return { status: 200, body: issueJson(repo, issue) };
+    if (method === 'GET') {
+      const cached = repo.issueJsonCache.get(num);
+      if (cached !== undefined) return { status: 200, body: null, bodyText: cached };
+      const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+      repo.issueJsonCache.set(num, text);
+      return { status: 200, body: null, bodyText: text };
+    }
     if (method === 'PATCH') {
+      invalidateIssueJson(repo, num);
       if (typeof body?.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state as 'open' | 'closed';
       if (typeof body?.title === 'string') issue.title = body.title as string;
       if (typeof body?.body === 'string') issue.body = body.body as string;
@@ -508,6 +525,7 @@ function handleIssues(store: Store, repo: Repo, method: string, rest: string[], 
       const text = typeof body?.body === 'string' ? (body.body as string) : '';
       const comment = { id: store.nextCommentId(), body: text, seq: store.nextSeq() };
       issue.comments.push(comment);
+      invalidateIssueJson(repo, num);
       return { status: 201, body: { id: comment.id, body: text, user: userJson(), created_at: FIXED_ISO, updated_at: FIXED_ISO } };
     }
     if (method === 'GET') {
