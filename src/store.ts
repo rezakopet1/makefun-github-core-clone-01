@@ -141,6 +141,8 @@ export interface Repo {
   nextIssue: number;
   nextPull: number;
   nextComment: number;
+  version: number;
+  fetchCache: Map<string, Buffer>;
 }
 
 function b64urlEncode(text: string): string {
@@ -211,6 +213,8 @@ export class Store {
       nextIssue: 1,
       nextPull: 1,
       nextComment: 1,
+      version: 0,
+      fetchCache: new Map(),
     };
     this.repos.set(k, repo);
     this.repoOrder.push(repo);
@@ -472,11 +476,13 @@ export function storeCommitFile(
     const treeOid = store.treeFromMap(repo, files);
     const commitSha = store.commitObject(repo, treeOid, tip === undefined ? [] : [tip], message);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    touchRepo(repo);
     return { status: existing === undefined ? 201 : 200, commitSha, contentSha: blobOid };
   }
   const treeOid = store.treeFromMap(repo, files);
   const commitSha = store.commitObject(repo, treeOid, tip === undefined ? [] : [tip], message);
   repo.refs.set(`refs/heads/${branch}`, commitSha);
+  touchRepo(repo);
   return { status: 200, commitSha, contentSha: existing };
 }
 
@@ -578,12 +584,52 @@ export function storeMergePull(
   const treeOid = store.treeFromMap(repo, merged);
   const sha = store.commitObject(repo, treeOid, [baseTip, headTip], `Merge pull request #${pull.number} from ${pull.head}`);
   repo.refs.set(`refs/heads/${pull.base}`, sha);
+  touchRepo(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = FIXED_ISO;
   pull.mergeCommitSha = sha;
   pull.baseSha = sha;
   return { status: 200, sha, message: `Merged #${pull.number}` };
+}
+
+// Fast zlib-stream inflate: one inflateSync with { info: true } reports the exact
+// number of input bytes the stream consumed (engine.bytesWritten), so a pack entry
+// needs a single inflate instead of a binary search full of throwing probes.
+// Feature-detected once: older Node returns a plain Buffer without `engine`.
+const INFLATE_INFO_WORKS: boolean = (() => {
+  try {
+    const probe = inflateSync(deflateSync(Buffer.from([1])), { info: true }) as unknown;
+    return (
+      !!probe &&
+      typeof probe === 'object' &&
+      'engine' in (probe as Record<string, unknown>) &&
+      typeof (probe as { engine?: { bytesWritten?: unknown } }).engine?.bytesWritten === 'number'
+    );
+  } catch {
+    return false;
+  }
+})();
+
+/** Inflate one pack entry starting at `start`; returns the data and bytes consumed. */
+function inflateEntry(buf: Buffer, start: number, end: number): { data: Buffer; consumed: number } {
+  if (INFLATE_INFO_WORKS) {
+    const r = inflateSync(buf.subarray(start, end), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    const consumed = r.engine.bytesWritten;
+    if (Number.isInteger(consumed) && consumed > 0 && start + consumed <= end) return { data: r.buffer, consumed };
+    // Fall through to the slow path if the engine did not report a usable length.
+  }
+  const data = inflateSync(buf.subarray(start, end));
+  return { data, consumed: zlibConsumed(buf, start, end) };
+}
+
+/** Bump a repo's mutation version and drop its cached fetch responses. */
+export function touchRepo(repo: Repo): void {
+  repo.version += 1;
+  repo.fetchCache.clear();
 }
 
 // Packfile helpers (plain objects only, no deltas) ---------------------------
@@ -611,7 +657,7 @@ export function writePack(objects: GitObject[]): Buffer {
     }
     bytes.push(first);
     parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(data));
+    parts.push(deflateSync(data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -667,14 +713,10 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`unknown pack type ${typeCode}`);
     }
-    const inflated = inflateSync(pack.subarray(offset, trailerStart));
-    if (inflated.length !== size) throw new Error('pack entry size mismatch');
-    // Find the end of the zlib stream: re-inflate is not incremental; use a
-    // fresh inflate that reports consumed bytes via a manual scan is costly,
-    // so instead locate the next entry by trying inflateSync on a window is
-    // wrong. Use zlib's inflate with a chunked approach below (see note).
-    entry.data = inflated;
-    offset = offset + zlibConsumed(pack, offset, trailerStart);
+    const inflated = inflateEntry(pack, offset, trailerStart);
+    if (inflated.data.length !== size) throw new Error('pack entry size mismatch');
+    entry.data = inflated.data;
+    offset = offset + inflated.consumed;
     raw.push(entry);
     byOffset.set(entryOffset, entry);
   }

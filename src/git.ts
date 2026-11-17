@@ -2,7 +2,7 @@
 // Plain (non-deltified) packfiles only; deltas on receipt are resolved.
 import { createHash } from 'node:crypto';
 import {
-  hashObject,
+  touchRepo,
   parseCommit,
   parseTag,
   parseTree,
@@ -203,21 +203,22 @@ export function fetchObjects(
       for (const oid of store.reachable(repo, [w])) wanted.add(oid);
     }
   }
-  const objects: GitObject[] = [];
+  const paired: Array<{ obj: GitObject; oid: string }> = [];
   for (const oid of wanted) {
     if (haveReachable.has(oid)) continue;
     const obj = repo.objects.get(oid);
-    if (obj) objects.push(obj);
+    if (obj) paired.push({ obj, oid });
   }
   // Deterministic pack order: commits, then trees, then blobs, then tags,
-  // each sorted by oid.
+  // each sorted by oid (the oid is the map key: no SHA-1 recomputation).
   const rank = (t: string): number => (t === 'commit' ? 0 : t === 'tree' ? 1 : t === 'blob' ? 2 : 3);
-  objects.sort((a, b) => {
-    const ra = rank(a.type);
-    const rb = rank(b.type);
+  paired.sort((a, b) => {
+    const ra = rank(a.obj.type);
+    const rb = rank(b.obj.type);
     if (ra !== rb) return ra - rb;
-    return hashObject(a.type, a.data) < hashObject(b.type, b.data) ? -1 : 1;
+    return a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0;
   });
+  const objects: GitObject[] = paired.map((p) => p.obj);
   return { objects, shallow: [...shallow].sort(), unshallow: [...unshallow].sort() };
 }
 
@@ -342,6 +343,9 @@ export function v2FetchResponse(
   repo: Repo,
   req: V2Request,
 ): Buffer {
+  const cacheKey = `v2|${[...req.wants].sort().join(',')}|${[...req.haves].sort().join(',')}|${req.depth ?? ''}|${[...req.shallow].sort().join(',')}`;
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const { objects, shallow, unshallow } = fetchObjects(store, repo, req.wants, req.haves, req.depth, req.shallow);
   const pack = writePack(objects);
   const parts: Buffer[] = [];
@@ -357,7 +361,9 @@ export function v2FetchResponse(
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(pack));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.fetchCache.set(cacheKey, out);
+  return out;
 }
 
 export function v0FetchResponse(
@@ -368,6 +374,9 @@ export function v0FetchResponse(
   depth: number | null,
   shallowBoundaries: string[],
 ): Buffer {
+  const cacheKey = `v0|${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${depth ?? ''}|${[...shallowBoundaries].sort().join(',')}`;
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const { objects, shallow, unshallow } = fetchObjects(store, repo, wants, haves, depth, shallowBoundaries);
   const pack = writePack(objects);
   const parts: Buffer[] = [];
@@ -376,7 +385,9 @@ export function v0FetchResponse(
   parts.push(pktLine('NAK\n'));
   parts.push(sidebandPack(pack));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.fetchCache.set(cacheKey, out);
+  return out;
 }
 
 export interface PushCommand {
@@ -429,9 +440,11 @@ export function applyPush(
   if (pack !== null && pack.length > 0) {
     try {
       const objects = readPack(pack);
+      let inserted = false;
       for (const [oid, obj] of objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
+        if (!repo.objects.has(oid)) { repo.objects.set(oid, obj); inserted = true; }
       }
+      if (inserted) touchRepo(repo);
     } catch {
       report.unpackOk = false;
       for (const c of commands) report.refs.push({ ref: c.ref, ok: false, reason: 'unpack failed' });
