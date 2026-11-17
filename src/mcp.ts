@@ -48,6 +48,7 @@ const TOOLS: ToolDef[] = [
       repo: { type: 'string', description: 'The repository name.' },
       title: { type: 'string', description: 'The issue title.' },
       body: { type: 'string', description: 'The issue body.' },
+      labels: { type: 'array', description: 'Labels to apply to the issue, by name.' },
     },
     required: ['owner', 'repo', 'title'],
   },
@@ -133,7 +134,8 @@ function callTool(store: Store, name: string, args: Record<string, unknown>): { 
   if (repo === undefined) return { result: toolError(`repository ${owner}/${repoName} not found`) };
   if (name === 'get_repo') return { result: toolResult(repoJson(repo)) };
   if (name === 'create_issue') {
-    const created = storeCreateIssue(store, repo, String(args.title ?? ''), String(args.body ?? ''), []);
+    const labels = Array.isArray(args.labels) ? (args.labels as unknown[]).map((l) => String(l)) : [];
+    const created = storeCreateIssue(store, repo, String(args.title ?? ''), String(args.body ?? ''), labels);
     if ('error' in created) return { result: toolError(created.error) };
     return { result: toolResult(issueJson(repo, created)) };
   }
