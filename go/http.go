@@ -15,6 +15,10 @@ import (
 const jsonType = "application/json; charset=utf-8"
 const maxBodyBytes = 32 * 1024 * 1024
 
+// healthzBody is the one constant JSON body; the boot probe hits it twice
+// per trial and it never changes, so marshal nothing per request.
+var healthzBody = []byte("{\"ok\":true}\n")
+
 var expectedToken = os.Getenv("MAKEFUN_SHOP_TOKEN")
 
 var requestCounter atomic.Uint64
@@ -147,7 +151,9 @@ func parseTarget(rawURL string) (*parsedTarget, bool) {
 	if pathPart == "" {
 		pathPart = "/"
 	}
-	pathPart = strings.ReplaceAll(pathPart, "\\", "/")
+	if strings.IndexByte(pathPart, '\\') >= 0 {
+		pathPart = strings.ReplaceAll(pathPart, "\\", "/")
+	}
 	var segs []string
 	for _, s := range strings.Split(pathPart, "/") {
 		switch s {
@@ -160,7 +166,10 @@ func parseTarget(rawURL string) (*parsedTarget, bool) {
 			segs = append(segs, s)
 		}
 	}
-	query, _ := url.ParseQuery(queryString)
+	var query url.Values
+	if queryString != "" {
+		query, _ = url.ParseQuery(queryString)
+	}
 	return &parsedTarget{segs: segs, query: query}, true
 }
 
@@ -188,7 +197,7 @@ func (h *forgeHandler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if method == "GET" && path == "/healthz" {
-		writeJSONValue(w, 200, map[string]any{"ok": true}, nil)
+		writeJSON(w, 200, healthzBody, nil)
 		return
 	}
 
