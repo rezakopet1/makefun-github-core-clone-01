@@ -33,8 +33,11 @@ The env is a server the harness starts beside yours. Its origin is in
 
 The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips
 TypeScript types on its own; the flag is harmless there and makes an older
-local Node work too. There is nothing to install: the program imports
-`node:http`, `node:crypto`, `node:zlib` and its own modules only.
+local Node work too. `main.ts` is a thin launcher: it spawns the compiled
+forge binary `./forge` (Go, stdlib only, built from `go/`), forwards signals
+to it, and exits with its code. There is nothing to install: the binary is
+committed in the repository, and the launcher imports `node:child_process`
+only.
 
 ## The surface
 
@@ -53,16 +56,23 @@ Every API call arrives with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN`;
 
 ## Layout
 
-- `main.ts`: the lifecycle. Kept as the starter ships it, plus one line.
-- `app.ts`: the HTTP server and the git smart-HTTP handlers.
-- `src/store.ts`: the in-memory store (repos, git objects, issues, pull
+- `main.ts`: the lifecycle launcher. Spawns `./forge`, forwards signals,
+  exits with its code.
+- `forge`: the compiled static Go binary (CGO_ENABLED=0, stripped, 6.4 MiB),
+  built from `go/` — see `DESIGN.md` for the build command.
+- `go/main.go`: the lifecycle (bind port 0, register, poll `/done`, exit 0)
+  and the HTTP server boot.
+- `go/http.go`: routing, auth, request ids, JSON senders, git smart-HTTP
+  dispatch.
+- `go/store.go`: the in-memory store (repos, git objects, issues, pull
   requests), packfile read/write, and the squash-merge logic.
-- `src/git.ts`: pkt-line framing, v2/v0 advertisements, ls-refs, fetch and
+- `go/git.go`: pkt-line framing, v2/v0 advertisements, ls-refs, fetch and
   receive-pack.
-- `src/rest.ts`: the REST v3 routes.
-- `src/graphql.ts`: a small GraphQL parser and executor for the checked
+- `go/rest.go`: the REST v3 routes.
+- `go/graphql.go`: a small GraphQL parser and executor for the checked
   documents.
-- `src/mcp.ts`: the MCP endpoint and its six tools.
+- `go/mcp.go`: the MCP endpoint and its six tools.
+- `DESIGN.md`: the design note this port was written from.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata
   and licence.
 
