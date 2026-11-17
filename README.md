@@ -1,12 +1,10 @@
-# github-core-clone-01
+# makefun-github-core-clone-01
 
-A standalone, one-process, no-UI GitHub-compatible git forge for
-[the contest](https://make.fun/bounty/github-core-clone-01), built by
-`{owner}` in the `{repo}` repository. It serves git smart HTTP
-(upload-pack protocol v2, receive-pack v0), REST v3 under `/api/v3`,
-GraphQL v4 at `/api/graphql` and MCP at `/mcp`, all from its own
-in-memory store, with no git binary, no outside service and no model
-calls.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/rezakopet1/makefun-github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/rezakopet1/makefun-github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+Build a standalone GitHub-compatible git forge: no UI, one process that serves git smart HTTP, the REST v3 API, GraphQL and MCP from its own store; a sealed suite drives it as a client while four timed workloads measure how fast it answers.
 
 ## Run it
 
@@ -14,10 +12,9 @@ calls.
 node --experimental-strip-types main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips
-TypeScript types on its own; the flag is harmless there and makes an older
-local Node work too. There is nothing to install: the program imports
-`node:http`, `node:crypto`, `node:zlib` and its own modules only.
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=a2zdf556&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
 
 ## The lifecycle (main.ts)
 
@@ -33,6 +30,11 @@ The env is a server the harness starts beside yours. Its origin is in
    `{"done":false}` while the suite runs and `{"done":true}` once its export
    is written. Poll it with a short backoff; never exit before it says `true`.
 4. **Exit 0** when it does.
+
+The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips
+TypeScript types on its own; the flag is harmless there and makes an older
+local Node work too. There is nothing to install: the program imports
+`node:http`, `node:crypto`, `node:zlib` and its own modules only.
 
 ## The surface
 
