@@ -97,19 +97,14 @@ func main() {
 		os.Exit(1)
 	}
 	store := NewStore()
-	server := &http.Server{
-		Handler:  &forgeHandler{store: store},
-		ErrorLog: nil,
-	}
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[entry] listen: %v\n", err)
 		os.Exit(1)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	go func() {
-		_ = server.Serve(ln)
-	}()
+	server := newRawServer(&forgeHandler{store: store}, ln)
+	go server.Serve()
 	fmt.Fprintf(os.Stdout, "[entry] listening on port %d\n", port)
 
 	client := &http.Client{Timeout: requestTimeout}
@@ -120,6 +115,6 @@ func main() {
 	fmt.Fprintln(os.Stdout, "[entry] registered; waiting for the env to say done")
 
 	waitForDone(client, envURL)
-	_ = server.Close()
+	server.Close()
 	fmt.Fprintln(os.Stdout, "[entry] done")
 }
